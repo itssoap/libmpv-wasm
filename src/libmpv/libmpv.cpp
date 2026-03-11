@@ -325,6 +325,60 @@ void load_file(string path, string options) {
     emscripten_proxy_async(main_queue, side_thread, load_file_proxy, args_ptr);
 }
 
+
+// ── FetchFS-backed HTTP streaming ──────────────────────────────────────────
+// Uses Emscripten's built-in FetchFS backend: the WASM C runtime issues
+// synchronous HTTP Range requests for each read(), so mpv streams on-demand
+// without downloading the entire file first.
+//
+// base_url: the URL up to (but not including) the filename, e.g.
+//           "https://host/api/download/file/ITEM_ID?account=ACC"
+//           FetchFS will append the filename when opening.
+// We mount one FetchFS directory per unique base_url.
+
+#include <map>
+static std::map<std::string, bool> fetchfs_mounts;
+static int fetchfs_counter = 0;
+
+typedef struct {
+    std::string base_url;
+    std::string filename;
+} load_url_args_t;
+
+void load_url_proxy(void* args) {
+    load_url_args_t* lua = (load_url_args_t*)args;
+
+    // Create a unique mount point for this base URL
+    std::string mount_name = "fetchfs_" + std::to_string(fetchfs_counter++);
+    std::string mount_path = "/" + mount_name;
+
+    printf("[FetchFS] Mounting %s at %s for file %s\n",
+           lua->base_url.c_str(), mount_path.c_str(), lua->filename.c_str());
+
+    backend_t backend = wasmfs_create_fetchfs_backend(lua->base_url.c_str());
+    int err = wasmfs_create_directory(mount_path.c_str(), 0777, backend);
+    if (err) {
+        fprintf(stderr, "[FetchFS] Couldn't mount directory at %s\n", mount_path.c_str());
+        free(args);
+        return;
+    }
+
+    std::string full_path = mount_path + "/" + lua->filename;
+    printf("[FetchFS] Loading file: %s\n", full_path.c_str());
+
+    const char* cmd[] = {"loadfile", full_path.c_str(), "replace", "0", "", NULL};
+    mpv_command_async(mpv, 0, cmd);
+    free(args);
+}
+
+void load_url(std::string base_url, std::string filename) {
+    printf("[FetchFS] load_url called: base=%s file=%s\n", base_url.c_str(), filename.c_str());
+    load_url_args_t* args_ptr = (load_url_args_t*)malloc(sizeof(load_url_args_t));
+    args_ptr->base_url = base_url;
+    args_ptr->filename = filename;
+    emscripten_proxy_async(main_queue, side_thread, load_url_proxy, args_ptr);
+}
+
 void open_disc_proxy(void* args) {
     filesystem::path path = *(string*)args;
     string root_name = *next(path.begin());
@@ -372,28 +426,7 @@ void load_files(vector<string> paths) {
     }
 }
 
-// void load_url_proxy(void* args) {
-//     string url = *(string*)args;
-//     filesystem::path path = url.substr(url.find("/") + 1);
-//     string root_path = "/" + string(*next(path.begin()));
-//     string root_url = "http://localhost:5000/proxy/" + url.substr(0, url.find("/", url.find("//") + 2));
-    
-//     if (!filesystem::is_directory(root_path)) {
-//         printf("mounting directory at %s\n", root_path.c_str());
-//         backend_t backend = wasmfs_create_fetchfs_backend(root_url.c_str());
-//         int err = wasmfs_create_directory(root_path.c_str(), 0777, backend);
-//         if (err) {
-//             fprintf(stderr, "Couldn't mount directory at %s\n", root_path.c_str());
-//             return;
-//         }
-//     }
 
-//     ifstream(path, ios::binary);
-
-//     // if (!filesystem::exists(path)) {
-//     //     fprintf(stderr, "file does not exist\n");
-//     //     return;
-//     // }
 
 //     const char * cmd[] = {"loadfile", path.c_str(), "replace", NULL};
 //     mpv_command_async(mpv, 0, cmd);
@@ -614,9 +647,8 @@ EMSCRIPTEN_BINDINGS(libmpv) {
     register_vector<string>("StringVector");
 
     emscripten::function("loadFile", &load_file);
+    emscripten::function("loadUrl", &load_url);
     emscripten::function("loadFiles", &load_files);
-    // emscripten::function("loadUrl", &load_url);
-    emscripten::function("togglePlay", &toggle_play);
     emscripten::function("stop", &stop);
     emscripten::function("setPlaybackTime", &set_playback_time_pos);
     emscripten::function("setVolume", &set_ao_volume);
