@@ -1,0 +1,72 @@
+*** Begin Patch
+*** Update File: /home/ubuntu/Others/libmpv-wasm-build/src/libmpv/libmpv.cpp
+@@
+ void load_file(string path, string options) {
+     load_file_args_t* args_ptr = (load_file_args_t*)malloc(sizeof(load_file_args_t));
+     args_ptr->path = path;
+     args_ptr->options = options;
+     emscripten_proxy_async(main_queue, side_thread, load_file_proxy, args_ptr);
+ }
++
++int ensure_externalfs_mount(const string& root_name) {
++    string root_path = "/" + root_name;
++
++    if (!filesystem::is_directory(root_path)) {
++        printf("mounting directory at %s\n", root_path.c_str());
++        backend_t backend = wasmfs_create_externalfs_backend(root_name.c_str());
++        int err = wasmfs_create_directory(root_path.c_str(), 0777, backend);
++        if (err) {
++            fprintf(stderr, "Couldn't mount directory at %s\n", root_path.c_str());
++            return err;
++        }
++    }
++
++    return 0;
++}
+ 
+ void open_disc_proxy(void* args) {
+     filesystem::path path = *(string*)args;
+     string root_name = *next(path.begin());
+-    string root_path = "/" + root_name;
+-
+-    if (!filesystem::is_directory(root_path)) {
+-        printf("mounting directory at %s\n", root_path.c_str());
+-        backend_t backend = wasmfs_create_externalfs_backend(root_name.c_str()); 
+-        int err = wasmfs_create_directory(root_path.c_str(), 0777, backend);     
+-        if (err) {
+-            fprintf(stderr, "Couldn't mount directory at %s\n", root_path.c_str());
+-            return;
+-        }
+-    }
++
++    if (ensure_externalfs_mount(root_name)) {
++        return;
++    }
+ 
+     if (!filesystem::is_directory(path)) {
+         fprintf(stderr, "%s is not a directory\n", path.c_str());
+         return;
+     }
+@@
+     disc_info = open_bd_disc(path);
+     free(args);
+ }
++
++int mount_externalfs_root(string root_name) {
++    return ensure_externalfs_mount(root_name);
++}
+ 
+ uint32_t open_disc(string path) {
+     string* path_ptr = (string*)malloc(sizeof(string));
+     *path_ptr = path;
+@@
+ EMSCRIPTEN_BINDINGS(libmpv) {
+     register_vector<string>("StringVector");
+ 
+     emscripten::function("loadFile", &load_file);
+     emscripten::function("loadFiles", &load_files);
++    emscripten::function("mountExternalFsRoot", &mount_externalfs_root);
+     // emscripten::function("loadUrl", &load_url);
+     emscripten::function("togglePlay", &toggle_play);
+     emscripten::function("stop", &stop);
+*** End Patch

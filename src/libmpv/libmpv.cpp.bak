@@ -325,32 +325,19 @@ void load_file(string path, string options) {
     emscripten_proxy_async(main_queue, side_thread, load_file_proxy, args_ptr);
 }
 
-// Helper: mount a named ExternalFS root (idempotent)
-static int ensure_externalfs_mount(const std::string& root_name) {
-    std::string root_path = "/" + root_name;
-    if (!filesystem::is_directory(root_path)) {
-        printf("mounting externalfs at %s\n", root_path.c_str());
-        backend_t backend = wasmfs_create_externalfs_backend(root_name.c_str());
-        int err = wasmfs_create_directory(root_path.c_str(), 0777, backend);
-        if (err) {
-            fprintf(stderr, "Couldn't mount externalfs at %s\n", root_path.c_str());
-            return err;
-        }
-    }
-    return 0;
-}
-
-// JS-callable: mount a named ExternalFS root and return errno (0 = ok)
-int mount_externalfs_root(string root_name) {
-    return ensure_externalfs_mount(root_name);
-}
-
 void open_disc_proxy(void* args) {
     filesystem::path path = *(string*)args;
     string root_name = *next(path.begin());
-    if (ensure_externalfs_mount(*next(path.begin()))) {
-        free(args);
-        return;
+    string root_path = "/" + root_name;
+    
+    if (!filesystem::is_directory(root_path)) {
+        printf("mounting directory at %s\n", root_path.c_str());
+        backend_t backend = wasmfs_create_externalfs_backend(root_name.c_str());
+        int err = wasmfs_create_directory(root_path.c_str(), 0777, backend);
+        if (err) {
+            fprintf(stderr, "Couldn't mount directory at %s\n", root_path.c_str());
+            return;
+        }
     }
     
     if (!filesystem::is_directory(path)) {
@@ -628,7 +615,6 @@ EMSCRIPTEN_BINDINGS(libmpv) {
 
     emscripten::function("loadFile", &load_file);
     emscripten::function("loadFiles", &load_files);
-    emscripten::function("mountExternalFsRoot", &mount_externalfs_root);
     // emscripten::function("loadUrl", &load_url);
     emscripten::function("togglePlay", &toggle_play);
     emscripten::function("stop", &stop);
