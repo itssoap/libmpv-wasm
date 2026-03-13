@@ -15,6 +15,28 @@
 #include <emscripten/wasmfs.h>
 #include <emscripten/proxying.h>
 
+extern "C" {
+    typedef int64_t (*mpv_stream_cb_size_fn)(void *cookie);
+    typedef int64_t (*mpv_stream_cb_read_fn)(void *cookie, char *buf, uint64_t nbytes);
+    typedef int64_t (*mpv_stream_cb_seek_fn)(void *cookie, int64_t offset);
+    typedef void    (*mpv_stream_cb_close_fn)(void *cookie);
+
+    typedef struct mpv_stream_cb_info {
+        void *cookie;
+        mpv_stream_cb_read_fn read_fn;
+        mpv_stream_cb_seek_fn seek_fn;
+        mpv_stream_cb_size_fn size_fn;
+        mpv_stream_cb_close_fn close_fn;
+        void (*cancel_fn)(void *cookie);
+    } mpv_stream_cb_info;
+
+    typedef int (*mpv_stream_cb_open_fn)(void *user_data, char *uri, mpv_stream_cb_info *info);
+
+    int mpv_stream_cb_add_ro(mpv_handle *ctx, const char *protocol, void *user_data, mpv_stream_cb_open_fn open_fn);
+}
+#include <emscripten/wasmfs.h>
+#include <emscripten/proxying.h>
+
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -60,12 +82,17 @@ void* loop(void* args) {
     return NULL;
 }
 
+static int chunked_open(void *user_data, char *uri, mpv_stream_cb_info *info);
+
 int main(int argc, char const *argv[]) {
     main_thread = pthread_self();
     pthread_create(&side_thread, NULL, loop, NULL);
 
     mpv = mpv_create();
     if (!mpv) die("context init failed");
+
+    // Register chunked:// stream protocol
+    mpv_stream_cb_add_ro(mpv, "chunked", NULL, chunked_open);
 
     mpv_set_property_string(mpv, "vo", "libmpv");
 
@@ -285,6 +312,8 @@ void main_loop() {
     }
 }
 
+static int ensure_externalfs_mount(const std::string& root_name);  // forward decl
+
 typedef struct {
     string path;
     string options;
@@ -297,15 +326,13 @@ void load_file_proxy(void* args) {
     string root_name = *next(path.begin());
     string root_path = "/" + root_name;
     
-    if (!filesystem::is_directory(root_path)) {
-        backend_t backend = wasmfs_create_externalfs_backend(root_name.c_str());
-        int err = wasmfs_create_directory(root_path.c_str(), 0777, backend);
-        if (err) {
-            fprintf(stderr, "Couldn't mount directory at %s\n", root_path.c_str());
-            return;
-        }
+    printf("load_file_proxy: is_directory(%s)=%d\n", root_path.c_str(), (int)filesystem::is_directory(root_path));
+    if (int mount_err = ensure_externalfs_mount(root_name)) {
+        fprintf(stderr, "load_file_proxy: ensure_externalfs_mount failed errno=%d\n", mount_err);
+        free(args);
+        return;
     }
-    
+        
     // printf("loading %s with options %s\n", path.c_str(), load_file_args->options.c_str());
     
     if (!filesystem::exists(path)) {
@@ -317,6 +344,120 @@ void load_file_proxy(void* args) {
     mpv_command_async(mpv, 0, cmd);
     free(args);
 }
+
+// -----------------------------------------------------------------------------
+// CHUNKED STREAM PROTOCOL IMPLEMENTATION
+// -----------------------------------------------------------------------------
+struct ChunkedStreamCookie {
+    int64_t size;
+    int64_t pos;
+    char url[2048];
+};
+
+static int64_t chunked_size_fn(void *cookie) {
+    ChunkedStreamCookie *ctx = (ChunkedStreamCookie*)cookie;
+    return ctx->size;
+}
+
+static int64_t chunked_read_fn(void *cookie, char *buf, uint64_t nbytes) {
+    ChunkedStreamCookie *ctx = (ChunkedStreamCookie*)cookie;
+    
+    // Read 0 bytes if at end of file, but let JS handle ranges safely
+    int actual_read = EM_ASM_INT({
+        var url = UTF8ToString($0);
+        var start = $1;
+        var len = $2;
+        var end = start + len - 1;
+        // console.log("[chunked_read] fetching", start, "-", end, "from URL:", url);
+        
+        var req = new XMLHttpRequest();
+        req.open('GET', url, false); // synchronous XHR
+        req.setRequestHeader('Range', 'bytes=' + start + '-' + end);
+        req.responseType = 'arraybuffer';
+        try {
+            req.send(null);
+        } catch(e) {
+            console.error('[chunked_read] sync fetch network error:', e);
+            return -1;
+        }
+        
+        if (req.status !== 206 && req.status !== 200) {
+            if (req.status === 416) return 0; // Range Not Satisfiable (EOF)
+            console.error('[chunked_read] bad status:', req.status);
+            return -1;
+        }
+        
+        var arr = new Uint8Array(req.response);
+        if (arr.length > len) {
+            console.warn('[chunked_read] Warning: Response length (' + arr.length + ') exceeds requested length (' + len + '). Truncating to avoid WASM heap corruption. Status: ' + req.status);
+            arr = arr.subarray(0, len);
+        }
+        var dest = $3;
+        HEAPU8.set(arr, dest);
+        return arr.length;
+    }, ctx->url, (int)ctx->pos, (int)nbytes, buf);
+    
+    if (actual_read > 0) {
+        ctx->pos += actual_read;
+    }
+    return actual_read >= 0 ? actual_read : 0; // mpv treats 0 as EOF, <0 might be error but we just return 0 to be safe
+}
+
+static int64_t chunked_seek_fn(void *cookie, int64_t offset) {
+    ChunkedStreamCookie *ctx = (ChunkedStreamCookie*)cookie;
+    if (offset < 0 || offset > ctx->size) return MPV_ERROR_INVALID_PARAMETER;
+    ctx->pos = offset;
+    return offset;
+}
+
+static void chunked_close_fn(void *cookie) {
+    ChunkedStreamCookie *ctx = (ChunkedStreamCookie*)cookie;
+    free(ctx);
+}
+
+static int chunked_open(void *user_data, char *uri, mpv_stream_cb_info *info) {
+    // uri is passed as: chunked://http://example.com/...
+    if (strncmp(uri, "chunked://", 10) != 0) return MPV_ERROR_INVALID_PARAMETER;
+    
+    const char* real_url = uri + 10;
+    
+    // HEAD request to resolve size
+    int64_t total_size = EM_ASM_INT({
+        var url = UTF8ToString($0);
+        var req = new XMLHttpRequest();
+        req.open('HEAD', url, false); // sync XHR
+        try {
+            req.send(null);
+            if (req.status !== 200 && req.status !== 206) return -1;
+            var cl = req.getResponseHeader('Content-Length');
+            return cl ? parseInt(cl, 10) : -1;
+        } catch(e) {
+            return -1;
+        }
+    }, real_url);
+    
+    if (total_size < 0) {
+        printf("[chunked_open] Could not determine file size via HEAD for URL: %s\n", real_url);
+        return MPV_ERROR_UNSUPPORTED; // Tell mpv we can't play this
+    }
+    
+    ChunkedStreamCookie *ctx = (ChunkedStreamCookie*)malloc(sizeof(ChunkedStreamCookie));
+    ctx->size = total_size;
+    ctx->pos = 0;
+    strncpy(ctx->url, real_url, sizeof(ctx->url) - 1);
+    ctx->url[sizeof(ctx->url) - 1] = '\0';
+    
+    info->cookie = ctx;
+    info->size_fn = chunked_size_fn;
+    info->read_fn = chunked_read_fn;
+    info->seek_fn = chunked_seek_fn;
+    info->close_fn = chunked_close_fn;
+    info->cancel_fn = nullptr;
+    
+    return 0; // success (MPV_ERROR_SUCCESS equivalent)
+}
+
+// -----------------------------------------------------------------------------
 
 void load_file(string path, string options) {
     load_file_args_t* args_ptr = (load_file_args_t*)malloc(sizeof(load_file_args_t));
