@@ -340,19 +340,9 @@ static int ensure_externalfs_mount(const std::string& root_name) {
     return 0;
 }
 
-// JS-callable: mount a named ExternalFS root — returns a Promise<void>
-// Uses emscripten_proxy_promise so the main thread stays free for the async
-// __wasmfs_externalfs_init_root_directory callback (no deadlock).
-void mount_externalfs_proxy(void* args) {
-    string* root_name_ptr = (string*)args;
-    ensure_externalfs_mount(*root_name_ptr);
-    delete root_name_ptr;
-}
-
-// JS-callable: dispatches to side_thread via proxy_promise; resolves when done.
-uint32_t mount_externalfs_root(string root_name) {
-    string* root_name_ptr = new string(root_name);
-    return (uint32_t)emscripten_proxy_promise(main_queue, side_thread, mount_externalfs_proxy, root_name_ptr);
+// JS-callable: mount a named ExternalFS root and return errno (0 = ok)
+int mount_externalfs_root(string root_name) {
+    return ensure_externalfs_mount(root_name);
 }
 
 void open_disc_proxy(void* args) {
