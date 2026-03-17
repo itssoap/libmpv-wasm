@@ -322,6 +322,19 @@ typedef struct {
 void load_file_proxy(void* args) {
     load_file_args_t* load_file_args = (load_file_args_t*)args;
 
+    // Protocol URLs (e.g. chunked://...) are handled by mpv's stream_cb
+    // system — they are NOT real filesystem paths.  Skip all FS checks
+    // and forward straight to mpv.
+    if (load_file_args->path.rfind("chunked://", 0) == 0) {
+        printf("load_file_proxy: protocol URL detected, forwarding to mpv: %s\n",
+               load_file_args->path.c_str());
+        const char * cmd[] = {"loadfile", load_file_args->path.c_str(), "replace", "0",
+                              load_file_args->options.c_str(), NULL};
+        mpv_command_async(mpv, 0, cmd);
+        free(args);
+        return;
+    }
+
     filesystem::path path = load_file_args->path;
     string root_name = *next(path.begin());
     string root_path = "/" + root_name;
